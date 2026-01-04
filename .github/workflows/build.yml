@@ -1,0 +1,216 @@
+name: Build Tasmota Custom Variants
+
+on:
+  # Check for new Tasmota releases every day at 2 AM UTC
+  schedule:
+    - cron: '0 2 * * *'
+  
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      tasmota_version:
+        description: 'Tasmota version to build (e.g., v13.4.0 or leave empty for latest)'
+        required: false
+        default: ''
+
+jobs:
+  check-release:
+    name: Check for new Tasmota release
+    runs-on: ubuntu-latest
+    outputs:
+      new_release: ${{ steps.check.outputs.new_release }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      release_name: ${{ steps.check.outputs.release_name }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Check for new Tasmota release
+        id: check
+        run: |
+          # Get the latest release from Tasmota repository
+          if [ -n "${{ github.event.inputs.tasmota_version }}" ]; then
+            LATEST_TAG="${{ github.event.inputs.tasmota_version }}"
+            echo "Using manually specified version: $LATEST_TAG"
+          else
+            LATEST_TAG=$(curl -s https://api.github.com/repos/arendst/Tasmota/releases/latest | jq -r .tag_name)
+            echo "Latest Tasmota release: $LATEST_TAG"
+          fi
+          
+          # Check if we already built this version
+          if git rev-parse "build-$LATEST_TAG" >/dev/null 2>&1; then
+            echo "Version $LATEST_TAG already built"
+            echo "new_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "New version detected: $LATEST_TAG"
+            echo "new_release=true" >> $GITHUB_OUTPUT
+            echo "release_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+            
+            # Get release name
+            RELEASE_NAME=$(curl -s https://api.github.com/repos/arendst/Tasmota/releases/latest | jq -r .name)
+            echo "release_name=$RELEASE_NAME" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    name: Build Tasmota variants
+    needs: check-release
+    if: needs.check-release.outputs.new_release == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variant:
+          - name: tasmota32s2-teleinfo
+            config: teleinfo
+          - name: tasmota32s2-script-watermeter
+            config: script-watermeter
+    
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+      
+      - name: Checkout Tasmota repository
+        uses: actions/checkout@v4
+        with:
+          repository: arendst/Tasmota
+          ref: ${{ needs.check-release.outputs.release_tag }}
+          path: tasmota
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: ${{ runner.os }}-pio-${{ hashFiles('**/platformio*.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+      
+      - name: Install PlatformIO
+        run: |
+          pip install --upgrade platformio
+          pio --version
+      
+      - name: Copy custom configuration
+        run: |
+          # Copy user_config_override.h to Tasmota directory
+          cp configs/${{ matrix.variant.config }}/user_config_override.h tasmota/tasmota/user_config_override.h
+          
+          # Create a custom platformio_tasmota_cenv.ini for this specific build
+          cat > tasmota/platformio_tasmota_cenv.ini << 'EOF'
+          [env:tasmota32s2-cenv]
+          extends = env:tasmota32s2
+          build_flags = ${env:tasmota32s2.build_flags}
+            -DUSE_CONFIG_OVERRIDE
+          EOF
+      
+      - name: Build firmware
+        working-directory: tasmota
+        run: |
+          pio run -e tasmota32s2-cenv
+      
+      - name: Prepare artifacts
+        run: |
+          mkdir -p output
+          VARIANT_NAME="${{ matrix.variant.name }}"
+          
+          # Copy firmware with generic name (version tracked by release tag)
+          cp tasmota/.pio/build/tasmota32s2-cenv/firmware.bin \
+             output/${VARIANT_NAME}.bin
+          
+          # Create factory image if exists
+          if [ -f tasmota/.pio/build/tasmota32s2-cenv/firmware.factory.bin ]; then
+            cp tasmota/.pio/build/tasmota32s2-cenv/firmware.factory.bin \
+               output/${VARIANT_NAME}.factory.bin
+          fi
+          
+          # Generate checksums
+          cd output
+          sha256sum *.bin > ${VARIANT_NAME}.sha256
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant.name }}
+          path: output/*
+          retention-days: 90
+
+  create-release:
+    name: Create GitHub release
+    needs: [check-release, build]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-files
+      
+      - name: Organize release files
+        run: |
+          mkdir -p final-release
+          find release-files -type f \( -name "*.bin" -o -name "*.sha256" \) | while read file; do
+            cp "$file" final-release/
+          done
+          ls -lah final-release/
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: build-${{ needs.check-release.outputs.release_tag }}
+          name: Custom Tasmota Builds - ${{ needs.check-release.outputs.release_name }}
+          body: |
+            # Custom Tasmota Builds - ${{ needs.check-release.outputs.release_tag }}
+            
+            Based on [Tasmota ${{ needs.check-release.outputs.release_tag }}](https://github.com/arendst/Tasmota/releases/tag/${{ needs.check-release.outputs.release_tag }})
+            
+            ## Available Variants
+            
+            ### 📊 ESP32-S2 Téléinfo
+            - **File**: `tasmota32s2-teleinfo.bin`
+            - **Features**: Teleinfo support for French electricity meters
+            - **OTA Compatible**: ✅ Yes
+            
+            ### 💧 ESP32-S2 Script WaterMeter
+            - **File**: `tasmota32s2-script-watermeter.bin`
+            - **Features**: Scripting support for water meter monitoring
+            - **Script**: Compatible with [TasmotaWaterMeter script](https://github.com/XHunter74/TasmotaWaterMeter)
+            - **OTA Compatible**: ✅ Yes
+            
+            ## Installation
+            
+            ### OTA Update (Recommended)
+            1. Go to your Tasmota device web interface
+            2. Navigate to **Firmware Upgrade**
+            3. Use the direct link to the `.bin` file from this release
+            
+            ### First Flash (USB)
+            1. Download the `.factory.bin` file (if available) or `.bin` file
+            2. Use [Tasmota Web Installer](https://tasmota.github.io/install/) or ESPTool
+            3. Flash to your ESP32-S2 device
+            
+            ## Checksums
+            SHA256 checksums are provided in the `.sha256` files for verification.
+          files: |
+            final-release/*.bin
+            final-release/*.sha256
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Tag this build
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag -a "build-${{ needs.check-release.outputs.release_tag }}" \
+            -m "Built from Tasmota ${{ needs.check-release.outputs.release_tag }}"
+          git push origin "build-${{ needs.check-release.outputs.release_tag }}"
