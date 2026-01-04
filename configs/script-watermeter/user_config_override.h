@@ -52,6 +52,11 @@
 #define USE_SENDMAIL            // Support for sending emails from scripts
 #define USE_SCRIPT_WEB_DISPLAY  // Enable web display for scripts
 
+#ifdef USE_RULES
+#undef USE_RULES
+#endif  
+
+
 // Enable Counter support for water meter pulse counting
 #define USE_COUNTER             // Enable counter support
 
